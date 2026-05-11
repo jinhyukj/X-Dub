@@ -46,3 +46,9 @@ dwpose_tools/models/*.onnx
 # Local audio feature caches
 *-large-v2.npy
 *-wav2vec*.npy
+modal_out/
+modal_out_h100_5clips/
+modal_out_h100_60s/
+*_benchmark_results.csv
+/checkpoints/
+results/

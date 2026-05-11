@@ -1033,8 +1033,16 @@ class VideoVAE_(nn.Module):
             mu = (mu - scale[0]) * scale[1]
         return mu
 
-    def decode(self, z, scale):
-        self.clear_cache()
+    def decode(self, z, scale, clear_cache=True):
+        # Per-frame decode loop with CPU accumulation: each iteration's output
+        # is moved to CPU immediately so peak GPU memory stays bounded by one
+        # frame's working set + the (small) feat_cache, regardless of total
+        # video length. Bit-exact identical to the previous behaviour for
+        # short videos (where the GPU-resident accumulator fit), and avoids
+        # OOM on long videos. clear_cache flag is preserved for API compat
+        # but is now informational — chunking at the call site is unnecessary.
+        if clear_cache:
+            self.clear_cache()
         # z: [b,c,t,h,w]
         if isinstance(scale[0], torch.Tensor):
             scale = [s.to(dtype=z.dtype, device=z.device) for s in scale]
@@ -1045,17 +1053,16 @@ class VideoVAE_(nn.Module):
             z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
+        cpu_chunks = []
         for i in range(iter_):
             self._conv_idx = [0]
-            if i == 0:
-                out, self._feat_map, self._conv_idx = self.decoder(x[:, :, i:i + 1, :, :],
-                                   feat_cache=self._feat_map,
-                                   feat_idx=self._conv_idx)
-            else:
-                out_, self._feat_map, self._conv_idx = self.decoder(x[:, :, i:i + 1, :, :],
-                                    feat_cache=self._feat_map,
-                                    feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2) # may add tensor offload
+            out_, self._feat_map, self._conv_idx = self.decoder(x[:, :, i:i + 1, :, :],
+                                feat_cache=self._feat_map,
+                                feat_idx=self._conv_idx)
+            cpu_chunks.append(out_.cpu())
+            del out_
+        out = torch.cat(cpu_chunks, dim=2)
+        del cpu_chunks
         return out
 
     def reparameterize(self, mu, log_var):
@@ -1234,9 +1241,9 @@ class WanVideoVAE(nn.Module):
         return x
 
 
-    def single_decode(self, hidden_state, device):
+    def single_decode(self, hidden_state, device, clear_cache=True):
         hidden_state = hidden_state.to(device)
-        video = self.model.decode(hidden_state, self.scale)
+        video = self.model.decode(hidden_state, self.scale, clear_cache=clear_cache)
         return video.clamp_(-1, 1)
 
 
@@ -1257,7 +1264,11 @@ class WanVideoVAE(nn.Module):
         return hidden_states
 
 
-    def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+    def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16), clear_cache=True):
+        # clear_cache=False forwards through to single_decode, letting the caller
+        # chunk a long latent sequence along time across multiple decode() calls
+        # while preserving the temporal causal-conv cache between them. Only
+        # supported on the non-tiled path.
         hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
         videos = []
         for hidden_state in hidden_states:
@@ -1265,7 +1276,7 @@ class WanVideoVAE(nn.Module):
             if tiled:
                 video = self.tiled_decode(hidden_state, device, tile_size, tile_stride)
             else:
-                video = self.single_decode(hidden_state, device)
+                video = self.single_decode(hidden_state, device, clear_cache=clear_cache)
             video = video.squeeze(0)
             videos.append(video)
         videos = torch.stack(videos)
@@ -1348,8 +1359,16 @@ class VideoVAE38_(VideoVAE_):
         return mu
 
 
-    def decode(self, z, scale):
-        self.clear_cache()
+    def decode(self, z, scale, clear_cache=True):
+        # Per-frame decode loop with CPU accumulation: each iteration's output
+        # is moved to CPU immediately so peak GPU memory stays bounded by one
+        # frame's working set + the (small) feat_cache, regardless of total
+        # video length. Bit-exact identical to the previous behaviour for
+        # short videos (where the GPU-resident accumulator fit), and avoids
+        # OOM on long videos. unpatchify is purely spatial — runs on the
+        # CPU-resident concatenated tensor.
+        if clear_cache:
+            self.clear_cache()
         if isinstance(scale[0], torch.Tensor):
             scale = [s.to(dtype=z.dtype, device=z.device) for s in scale]
             z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
@@ -1359,10 +1378,11 @@ class VideoVAE38_(VideoVAE_):
             z = z / scale[1] + scale[0]
         iter_ = z.shape[2]
         x = self.conv2(z)
+        cpu_chunks = []
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
-                out, self._feat_map, self._conv_idx = self.decoder(x[:, :, i:i + 1, :, :],
+                out_, self._feat_map, self._conv_idx = self.decoder(x[:, :, i:i + 1, :, :],
                                    feat_cache=self._feat_map,
                                    feat_idx=self._conv_idx,
                                    first_chunk=True)
@@ -1370,9 +1390,13 @@ class VideoVAE38_(VideoVAE_):
                 out_, self._feat_map, self._conv_idx = self.decoder(x[:, :, i:i + 1, :, :],
                                     feat_cache=self._feat_map,
                                     feat_idx=self._conv_idx)
-                out = torch.cat([out, out_], 2)
+            cpu_chunks.append(out_.cpu())
+            del out_
+        out = torch.cat(cpu_chunks, dim=2)
+        del cpu_chunks
         out = unpatchify(out, patch_size=2)
-        self.clear_cache()
+        if clear_cache:
+            self.clear_cache()
         return out
 
 

@@ -289,6 +289,19 @@ class LipSyncPipeline(BasePipeline):
             "tea_cache_l1_thresh": tea_cache_l1_thresh, "tea_cache_model_id": tea_cache_model_id, "num_inference_steps": num_inference_steps,
         }
 
+        # ============================================================
+        # STAGES 3a–3d: Preprocessing units (run sequentially per clip)
+        # ============================================================
+        # Each unit is executed via unit_runner in the order declared in __init__:
+        #   1. WanVideoUnit_ShapeChecker           — validates (height, width, num_frames)
+        #   2. WanVideoUnit_NoiseInitializer        — samples latent Gaussian noise
+        #   3. WanVideoUnit_PromptEmbedder         — T5 umt5-xxl encode (STAGE 3b)
+        #   4. WanVideoUnit_TargetVideoEmbedder    — target-video VAE encode (STAGE 3c)
+        #   5. WanVideoUnit_ReferenceVideoEmbedder — reference-video VAE encode (STAGE 3c)
+        #   6. WanVideoUnit_MotionVideoEmbedder    — motion-frame VAE encode (STAGE 3c)
+        #   7. WanVideoUnit_MaskEmbedder           — mouth-mask preparation
+        #   8. WanVideoUnit_LipSync                — Whisper + Wav2Vec audio encode (STAGE 3a)
+        #   9. WanVideoUnit_TeaCache               — (unused / placeholder)
         for unit in self.units:
             print(f"Running unit: {unit.__class__.__name__}")
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
@@ -307,19 +320,25 @@ class LipSyncPipeline(BasePipeline):
             # no cfg
             inputs["context"] = torch.cat([inputs["context"]] * 3, dim=0) 
 
-        # Prepare model for denoising
-        # onload dit; offload others 
+        # ============================================================
+        # STAGE 3d: DiT Diffusion Denoising Loop (GPU)
+        # ============================================================
+        # Runs num_inference_steps (default 30) denoising steps on the DiT with
+        # 3-way CFG merging (uncond / ref-only / ref+audio) and optional dynamic CFG
+        # scheduling. Each step also replaces the latent border with a partially-
+        # noised reference latent (replace_border_latents) to reduce crop-edge seams.
+        # Prepare model for denoising — onload dit; offload others
         self.load_models_to_device(self.in_iteration_models)
         # offload audio_processor maunally (not in vram management)
-        if self.whisper_processor.device.type != "cpu": 
+        if self.whisper_processor.device.type != "cpu":
             print(f"[VRAM] whisper_processor: manually offload.")
             self.whisper_processor.to("cpu")
         if self.wav2vec_processor.device.type != "cpu":
             print(f"[VRAM] wav2vec_processor: manually offload.")
             self.wav2vec_processor.to("cpu")
-        # Denoise 
+        # Denoise
         models = {name: getattr(self, name) for name in self.in_iteration_models}
-        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):                
+        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device) 
             # border replace
@@ -371,6 +390,14 @@ class LipSyncPipeline(BasePipeline):
             if inputs.get("motion_latents") is not None:
                 inputs["latents"][:, :, 0:motion_latents_num_frames] = inputs["motion_latents"]
         
+        # ============================================================
+        # Per-clip VAE Decode (GPU) — NOT the "final" decode
+        # ============================================================
+        # Each pipe() call decodes its own clip's denoised latents here, but the
+        # outer driver (infer_lip_sync_pipeline.py) also accumulates clean latents
+        # across clips and runs ONE more "final VAE decode" on the concatenated
+        # latents after the last clip (see STAGE 4 in infer_lip_sync_pipeline.py).
+        # This per-clip decode is used for color correction + motion-frame extraction.
         self.load_models_to_device(['vae'])
         video = self.vae.decode(inputs["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if output_type == "quantized":
@@ -383,6 +410,7 @@ class LipSyncPipeline(BasePipeline):
 
 
 class WanVideoUnit_ShapeChecker(PipelineUnit):
+    """[Preprocessing] Validate height/width/num_frames are compatible with DiT patching."""
     def __init__(self):
         super().__init__(
             input_params=("height", "width", "num_frames"),
@@ -394,6 +422,7 @@ class WanVideoUnit_ShapeChecker(PipelineUnit):
         return {"height": height, "width": width, "num_frames": num_frames}
 
 class WanVideoUnit_NoiseInitializer(PipelineUnit):
+    """[Preprocessing] Sample Gaussian noise tensor at the latent resolution (batch, z_dim, T_lat, H_lat, W_lat)."""
     def __init__(self):
         super().__init__(
             input_params=("height", "width", "num_frames", "batch_size", "seed", "rand_device"),
@@ -408,6 +437,7 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
         return {"noise": noise}
     
 class WanVideoUnit_PromptEmbedder(PipelineUnit):
+    """[STAGE 3b] Text encode via T5 umt5-xxl. Empty prompt "" is used in practice."""
     def __init__(self):
         super().__init__(
             seperate_cfg=True,
@@ -453,6 +483,7 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         return {"context": prompt_emb}
     
 class WanVideoUnit_TargetVideoEmbedder(PipelineUnit):
+    """[STAGE 3c] VAE encode the target video (if provided) — Wan 2.2 VAE, 3D causal, 4x temporal compression."""
     def __init__(self):
         super().__init__(
             input_params=("tgt_video", "tgt_latents", "noise", "tiled", "tile_size", "tile_stride"),
@@ -488,6 +519,7 @@ class WanVideoUnit_TargetVideoEmbedder(PipelineUnit):
         return {"latents": noise.clone(), "tgt_latents": tgt_latents} 
 
 class WanVideoUnit_ReferenceVideoEmbedder(PipelineUnit):
+    """[STAGE 3c] VAE encode the reference (crop) video — identity/pose context for the DiT."""
     def __init__(self):
         super().__init__(
             input_params=("ref_video", "ref_latents", "tiled", "tile_size", "tile_stride"),
@@ -508,17 +540,25 @@ class WanVideoUnit_ReferenceVideoEmbedder(PipelineUnit):
                 for ref_latents_item in ref_latents
             ], dim=0)
             return {"ref_latents": ref_latents}
-        pipe.load_models_to_device(self.onload_model_names) 
+        pipe.load_models_to_device(self.onload_model_names)
         ref_video = torch.cat([
             pipe.preprocess_video(ref_video_item, torch_dtype=pipe.torch_dtype, device=pipe.device)
             for ref_video_item in ref_video
         ], dim=0) # [B,C,T,H,W]
+        # Mark start of pure_encode_to_decode (Def 2 narrow) on the FIRST vae.encode call.
+        # Subsequent calls (motion encode, later clips) leave this untouched.
+        if not hasattr(pipe, "_e2d_t0"):
+            import time as _time
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            pipe._e2d_t0 = _time.perf_counter()
         with torch.no_grad():
             ref_latents = pipe.vae.encode(ref_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device) # torch.Size([B, 48, 20, 32, 32])
         return {"ref_latents": ref_latents}
 
 
-class WanVideoUnit_MotionVideoEmbedder(PipelineUnit): 
+class WanVideoUnit_MotionVideoEmbedder(PipelineUnit):
+    """[STAGE 3c] VAE encode the last motion_latents_num_frames (2) frames from the previous clip for temporal continuity."""
     def __init__(self):
         super().__init__(
             input_params=("motion_video", "latents", "motion_latents_num_frames", "tiled", "tile_size", "tile_stride"),
@@ -543,8 +583,10 @@ class WanVideoUnit_MotionVideoEmbedder(PipelineUnit):
         return {"latents": latents, "use_motion_latents": True, "motion_latents": motion_latents}
 
 
-class WanVideoUnit_MaskEmbedder(PipelineUnit): 
-    """
+class WanVideoUnit_MaskEmbedder(PipelineUnit):
+    """[Preprocessing] Downsample lip masks from pixel space (512x512) to latent space for DiT conditioning.
+    Note: X-Dub is 'mask-free' at the editing level, but it still uses mouth-region masks internally
+    for loss weighting / auxiliary conditioning during inference.
     downsample lip masks
     """
     def __init__(self):
@@ -618,6 +660,7 @@ class WanVideoUnit_TeaCache(PipelineUnit):
 
 
 class WanVideoUnit_LipSync(PipelineUnit):
+    """[STAGE 3a] Audio encode: Whisper-large-v2 encoder + Wav2Vec2-base-960h, features cached across clips."""
     def __init__(self):
         super().__init__(
             take_over=True,
