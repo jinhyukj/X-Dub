@@ -42,12 +42,13 @@ DEFAULT_WHISPER_PATH = os.path.join(CHECKPOINTS_DIR, "whisper", "large-v2.pt")
 DEFAULT_WAV2VEC_PATH = os.path.join(CHECKPOINTS_DIR, "wav2vec2-base-960h")
 
 vram_config = {
-    # "offload_dtype": "disk",
-    # "offload_device": "disk",
+    # Keep all weights GPU-resident so X-Dub doesn't pay CPU<->GPU
+    # transfer cost between every 77-frame sub-clip of long videos.
+    # H200 has 144 GB; full pipeline footprint is ~26 GB.
     "offload_dtype": torch.bfloat16,
-    "offload_device": "cpu",
+    "offload_device": "cuda",
     "onload_dtype": torch.bfloat16,
-    "onload_device": "cpu",
+    "onload_device": "cuda",
     "preparing_dtype": torch.bfloat16,
     "preparing_device": "cuda",
     "computation_dtype": torch.bfloat16,
